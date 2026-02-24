@@ -34,20 +34,37 @@ async function fetchAllPages(endpoint, limit = 50) {
 
 const loaders = {
   characters: async () => {
-    const items = await fetchAllPages('/characters', 50);
-    return items.map(c => ({
-      id:              String(c.id),
-      name:            c.name            || 'Unknown',
-      ki:              c.ki              || '—',
-      maxKi:           c.maxKi           || '—',
-      race:            c.race            || '—',
-      gender:          c.gender          || '—',
-      description:     c.description     || '',
-      image:           c.image           || null,
-      affiliation:     c.affiliation     || '—',
-      originPlanet:    c.originPlanet    || null,
-      transformations: c.transformations || [],
-    }));
+    const basicItems = await fetchAllPages('/characters', 50);
+    console.log(`  🧬 Obteniendo transformaciones para ${basicItems.length} personajes...`);
+    const detailedCharacters = await Promise.all(
+      basicItems.map(async (c) => {
+        try {
+          const { data } = await axios.get(`${DB_API}/characters/${c.id}`, { timeout: 10000 });
+          return {
+            id:              String(data.id),
+            name:            data.name            || 'Unknown',
+            ki:              data.ki              || '—',
+            maxKi:           data.maxKi           || '—',
+            race:            data.race            || '—',
+            gender:          data.gender          || '—',
+            description:     data.description     || '',
+            image:           data.image           || null,
+            affiliation:     data.affiliation     || '—',
+            originPlanet:    data.originPlanet    || null,
+            transformations: (data.transformations || []).map(t => ({
+              id:    String(t.id),
+              name:  t.name  || 'Unknown',
+              image: t.image || null,
+              ki:    t.ki    || '—',
+            })),
+          };
+        } catch (err) {
+          console.error(`  ⚠️ Error cargando detalle de ${c.name}:`, err.message);
+          return null;
+        }
+      })
+    );
+    return detailedCharacters.filter(Boolean);
   },
 
   planets: async () => {
@@ -90,7 +107,8 @@ async function loadResource(resource) {
 async function preloadAll() {
   console.log('🐉 Precargando Dragon Ball...');
   await Promise.all(Object.keys(loaders).map(loadResource));
-  console.log('🐉 Listo:', { characters: cache.characters.length, planets: cache.planets.length });
+  const totalT = cache.characters.reduce((acc, c) => acc + (c.transformations?.length || 0), 0);
+  console.log('🐉 Listo:', { characters: cache.characters.length, planets: cache.planets.length, transformations: totalT });
 }
 
 function paginate(items, { page = 1, limit = 20, search, race, affiliation, gender } = {}) {
@@ -102,7 +120,6 @@ function paginate(items, { page = 1, limit = 20, search, race, affiliation, gend
   if (race)        data = data.filter(i => i.race?.toLowerCase()        === race.toLowerCase());
   if (affiliation) data = data.filter(i => i.affiliation?.toLowerCase() === affiliation.toLowerCase());
   if (gender)      data = data.filter(i => i.gender?.toLowerCase()      === gender.toLowerCase());
-
   const total = data.length;
   const start = (page - 1) * limit;
   return {
@@ -116,7 +133,7 @@ function paginate(items, { page = 1, limit = 20, search, race, affiliation, gend
 async function ensureLoaded(resource, res, next) {
   if (!cache.loaded[resource]) {
     let waited = 0;
-    while (!cache.loaded[resource] && waited < 12000) {
+    while (!cache.loaded[resource] && waited < 30000) {
       await new Promise(r => setTimeout(r, 300));
       waited += 300;
     }
@@ -125,7 +142,7 @@ async function ensureLoaded(resource, res, next) {
   next();
 }
 
-// ── RUTAS ─────────────────────────────────────────────────────────────────────
+// ── RUTAS ────────────────────────────────────────────────────────────────────
 
 app.get('/api/universe', async (req, res) => {
   await Promise.all(Object.keys(loaders).filter(r => !cache.loaded[r]).map(loadResource));
@@ -157,6 +174,25 @@ app.get('/api/planets/:id', (req, res, next) => ensureLoaded('planets', res, nex
   res.json(item);
 });
 
+app.get('/api/transformations', (req, res, next) => ensureLoaded('characters', res, next), (req, res) => {
+  const all = [];
+  cache.characters.forEach(c => {
+    (c.transformations || []).forEach(t => {
+      all.push({
+        id:            t.id,
+        name:          t.name,
+        image:         t.image,
+        ki:            t.ki,
+        characterId:   c.id,
+        characterName: c.name,
+        race:          c.race,
+      });
+    });
+  });
+  const { page = 1, limit = 20, search } = req.query;
+  res.json(paginate(all, { page: +page, limit: +limit, search }));
+});
+
 app.get('/api/races', (req, res, next) => ensureLoaded('characters', res, next), (req, res) => {
   res.json([...new Set(cache.characters.map(c => c.race).filter(Boolean))].sort());
 });
@@ -166,9 +202,11 @@ app.get('/api/affiliations', (req, res, next) => ensureLoaded('characters', res,
 });
 
 app.get('/api/cache/status', (req, res) => {
+  const totalT = cache.characters.reduce((acc, c) => acc + (c.transformations?.length || 0), 0);
   res.json({
-    characters: { loaded: !!cache.loaded.characters, count: cache.characters.length },
-    planets:    { loaded: !!cache.loaded.planets,    count: cache.planets.length },
+    characters:      { loaded: !!cache.loaded.characters, count: cache.characters.length },
+    planets:         { loaded: !!cache.loaded.planets,    count: cache.planets.length },
+    transformations: { count: totalT },
   });
 });
 
@@ -176,11 +214,12 @@ app.get('/health', (req, res) => res.json({ status: 'OK', message: '🐉 Dragon 
 
 app.listen(PORT, () => {
   console.log(`🐉 Dragon Ball server en http://localhost:${PORT}`);
-  console.log(`   GET /api/universe      → personajes + planetas de una vez`);
-  console.log(`   GET /api/characters    → paginado + filtros (race, affiliation, gender, search)`);
+  console.log(`   GET /api/universe`);
+  console.log(`   GET /api/characters`);
   console.log(`   GET /api/characters/:id`);
   console.log(`   GET /api/planets`);
   console.log(`   GET /api/planets/:id`);
+  console.log(`   GET /api/transformations`);
   console.log(`   GET /api/races`);
   console.log(`   GET /api/affiliations`);
   console.log(`   GET /api/cache/status`);
